@@ -365,13 +365,14 @@ mod tests {
 	}
 
 	/// `--leaf-align=panel32`: when set, the produced archive's root
-	/// directory entries' tile_ids are panel_start values (multiples of
-	/// 1024 for panel[32]). Standard byte-budget packing puts them at
-	/// arbitrary tile_ids.
+	/// directory entries' tile_ids are cell-start values aligned to
+	/// `(z, x / panel_side, y / panel_side)` cells. Standard byte-budget
+	/// packing puts them at arbitrary tile_ids.
 	///
 	/// To force leaves we pack many tiles AND a tiny root budget by using
-	/// panel_size=8 (small enough that leaves are always emitted at the
-	/// 4-zoom MockReader scale of 341 tiles).
+	/// panel_size=4 (panel_side=2: small enough that leaves are emitted at
+	/// the 4-zoom MockReader scale of 341 tiles, and a perfect-square
+	/// power-of-two as the algorithm requires).
 	#[context("test: PMTiles --leaf-align produces panel-aligned roots")]
 	#[tokio::test]
 	async fn leaf_align_panel_aligned_root() -> Result<()> {
@@ -381,7 +382,7 @@ mod tests {
 		)?;
 
 		let runtime = TilesRuntime::default();
-		runtime.set_pmtiles_leaf_align(8); // small panel size to force leaves at 341-tile mock scale
+		runtime.set_pmtiles_leaf_align(4); // panel_side=2; forces leaves at 341-tile mock scale
 
 		let mut data_writer = DataWriterBlob::new()?;
 		PMTilesWriter::write_to_writer(&mut mock, &mut data_writer, runtime.clone()).await?;

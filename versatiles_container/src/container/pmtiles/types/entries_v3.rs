@@ -6,10 +6,10 @@ use std::{
 	slice::{Iter, SliceIndex},
 };
 use versatiles_core::{
-	Blob, ByteRange, TileCompression,
+	Blob, ByteRange, TileCompression, TileCoord,
 	compression::compress,
 	io::{ValueReader, ValueReaderSlice, ValueWriter, ValueWriterBlob},
-	utils::float_to_int,
+	utils::{HilbertIndex, float_to_int},
 };
 
 /// A collection of `EntryV3` that provides various utility functions
@@ -138,12 +138,22 @@ impl EntriesV3 {
 	/// # Arguments
 	/// * `target_root_len` - The maximum size of the root directory in bytes.
 	/// * `compression` - The compression method to be applied.
-	/// * `leaf_align` - Optional panel size. When `Some(N)`, the leaf-packing
-	///   path slices entries by tile_id range `[panel_start, panel_start + N)`
-	///   instead of by entry-count budget. Each leaf contains entries whose
-	///   tile_ids fall in one such panel; root entries' tile_ids are
-	///   panel_start values (NOT the first present entry in each panel).
-	///   Used by the panel-pmtiles format (panel_size = 1024 = panel[32]).
+	/// * `leaf_align` - Optional panel size (must be a perfect square).
+	///   When `Some(N)`, the leaf-packing path slices entries so that each
+	///   leaf covers exactly one `(z, x / panel_side, y / panel_side)` cell
+	///   where `panel_side = isqrt(N)`. This means each leaf contains only
+	///   entries from a single (zoom, panel-cell) combination. Root entries'
+	///   tile_ids are the smallest tile_id reachable in that cell (NOT the
+	///   first present entry's tile_id), so PMTiles' "find largest entry
+	///   with tile_id ≤ target" lookup always routes target tile_ids in the
+	///   cell range to the correct leaf — even for sparse leaves.
+	///
+	///   Used by the panel-pmtiles format (panel_size = 1024 = panel[32],
+	///   panel_side = 32). At zoom levels where `2^z < panel_side` the entire
+	///   zoom collapses to a single cell `(z, 0, 0)` and gets its own leaf
+	///   (1, 4, 16, … entries respectively). At higher zooms, each leaf holds
+	///   entries from one panel-aligned cell.
+	///
 	///   When `None`, packs leaves by byte-budget (the original upstream
 	///   behaviour).
 	///
@@ -224,38 +234,69 @@ impl EntriesV3 {
 			})
 		}
 
-		/// Panel-aligned leaf packing: each leaf holds entries whose tile_id
-		/// falls in `[panel_start, panel_start + panel_size)`. Root entries
-		/// use `panel_start` as their tile_id (NOT the first present entry's
-		/// tile_id) so PMTiles' "find largest entry with tile_id ≤ target"
-		/// lookup correctly hits this leaf for any target tile_id in the
-		/// panel range — including sparse-panel cases where the first present
-		/// entry is far into the panel.
+		/// Panel-aligned leaf packing: each leaf holds entries whose
+		/// `(z, x / panel_side, y / panel_side)` is the same — i.e. one leaf
+		/// per panel-cell. Root entries use the cell's smallest reachable
+		/// tile_id (NOT the first present entry's tile_id) so PMTiles' "find
+		/// largest entry with tile_id ≤ target" lookup correctly routes any
+		/// target tile_id in the cell to this leaf — including sparse cells
+		/// where the first present entry sits far into the cell.
+		///
+		/// `panel_size` must be a perfect square; `panel_side = isqrt(panel_size)`
+		/// is the cell side length in tiles. For panel32, `panel_size = 1024`
+		/// and `panel_side = 32`.
+		///
+		/// At zoom levels where `2^z < panel_side`, the whole grid is smaller
+		/// than one panel cell, so the cell collapses to `(z, 0, 0)` and the
+		/// entire zoom level becomes a single leaf (1, 4, 16, … entries).
 		fn build_roots_leaves_panel_aligned(
 			entries: &EntriesSliceV3,
 			panel_size: u64,
 			compression: TileCompression,
 		) -> Result<Directory> {
+			let panel_side_u64 = panel_size.isqrt();
+			if panel_side_u64 * panel_side_u64 != panel_size {
+				bail!(
+					"leaf_align panel_size {panel_size} is not a perfect square; cannot derive panel_side"
+				);
+			}
+			let panel_side = u32::try_from(panel_side_u64)
+				.map_err(|_| anyhow::anyhow!("leaf_align panel_side {panel_side_u64} exceeds u32"))?;
+			if panel_side == 0 {
+				bail!("leaf_align panel_size must be > 0");
+			}
+
 			let mut root_entries = EntriesV3::new();
 			let mut leaves_bytes: Vec<u8> = Vec::new();
 
+			// Decode the cell of entries[idx]: (level, x/panel_side, y/panel_side).
+			let cell_of = |i: usize| -> Result<(u8, u32, u32)> {
+				let coord = TileCoord::from_hilbert_index(entries.get(i).tile_id)?;
+				Ok((coord.level, coord.x / panel_side, coord.y / panel_side))
+			};
+
 			let mut idx: usize = 0;
 			while idx < entries.len() {
-				// Panel containing entries[idx].
-				let panel_start = (entries.get(idx).tile_id / panel_size) * panel_size;
-				let panel_end = panel_start + panel_size;
+				let cell = cell_of(idx)?;
 
-				// Find the first index whose tile_id is >= panel_end. All
-				// entries in [idx, end) belong to this panel.
+				// Walk forward while subsequent entries share the same cell.
+				// Entries are sorted by tile_id; within a panel-aligned cell
+				// the tile_ids are contiguous in Hilbert order, so once a
+				// neighbouring tile_id leaves this cell we are done.
 				let mut end = idx + 1;
-				while end < entries.len() && entries.get(end).tile_id < panel_end {
+				while end < entries.len() && cell_of(end)? == cell {
 					end += 1;
 				}
 
 				let serialized = compress(entries.slice(idx..end).serialize_entries()?, &compression)?;
 
+				// Cell start: the smallest tile_id reachable in this cell.
+				// We need this (not entries[idx].tile_id) so that lookups for
+				// missing tile_ids in the cell still route to this leaf.
+				let cell_start = cell_first_tile_id(cell, panel_side)?;
+
 				root_entries.push(EntryV3::new(
-					panel_start, // NOT entries[idx].tile_id — see doc comment
+					cell_start,
 					ByteRange::new(leaves_bytes.len() as u64, serialized.len() as u64),
 					0,
 				));
@@ -270,6 +311,56 @@ impl EntriesV3 {
 				root_bytes,
 				leaves_bytes: Blob::from(leaves_bytes),
 			})
+		}
+
+		/// Smallest Hilbert tile_id reachable in cell `(z, panel_x, panel_y)`.
+		///
+		/// At zooms where `2^z <= panel_side` the grid fits inside a single
+		/// cell `(z, 0, 0)` and the smallest tile_id is the start of the
+		/// zoom's segment in the global Hilbert stream, i.e. `(4^z - 1) / 3`.
+		///
+		/// At higher zooms, the 1024 (or `panel_side²`) tile_ids in any
+		/// panel-aligned cell are contiguous in Hilbert order — that's a
+		/// property of how the curve recursively quadrants — so the cell's
+		/// minimum is `zoom_start(z) + panel_index_within_zoom * panel_size`,
+		/// where `panel_index_within_zoom` is the Hilbert index of
+		/// `(panel_x, panel_y)` on the panel-grid at zoom
+		/// `z - log2(panel_side)`.
+		fn cell_first_tile_id(cell: (u8, u32, u32), panel_side: u32) -> Result<u64> {
+			let (z, px, py) = cell;
+			if !panel_side.is_power_of_two() {
+				bail!("leaf_align panel_side {panel_side} must be a power of two");
+			}
+			// Zoom-segment start: 1 + 4 + 16 + ... + 4^(z-1) = (4^z - 1) / 3.
+			let zoom_start: u64 = if z == 0 { 0 } else { ((1u64 << (2 * z)) - 1) / 3 };
+
+			let panel_side_log2 = panel_side.trailing_zeros();
+
+			if u32::from(z) <= panel_side_log2 {
+				// Whole grid fits in cell (0, 0); only valid cell is (z, 0, 0).
+				debug_assert_eq!((px, py), (0, 0), "cell at z<=log2(panel_side) must be (0,0)");
+				return Ok(zoom_start);
+			}
+
+			// At zoom z with z > log2(panel_side), panels form a Hilbert grid
+			// at level (z - log2(panel_side)). The cell's tile_ids start at
+			// `zoom_start(z) + local_panel_index * panel_side²`, where
+			// local_panel_index is the *zoom-local* Hilbert index of
+			// (px, py) — i.e. global_index − zoom_start(panel_grid_level).
+			let panel_grid_level =
+				u8::try_from(u32::from(z) - panel_side_log2).expect("panel grid level fits in u8");
+			let panel_grid_coord = TileCoord::new(panel_grid_level, px, py)?;
+			let panel_grid_zoom_start: u64 = if panel_grid_level == 0 {
+				0
+			} else {
+				((1u64 << (2 * panel_grid_level)) - 1) / 3
+			};
+			let local_panel_index = panel_grid_coord
+				.get_hilbert_index()?
+				.checked_sub(panel_grid_zoom_start)
+				.ok_or_else(|| anyhow::anyhow!("hilbert index < zoom_start (impossible)"))?;
+			let panel_size_u64 = u64::from(panel_side) * u64::from(panel_side);
+			Ok(zoom_start + local_panel_index * panel_size_u64)
 		}
 	}
 
@@ -588,44 +679,58 @@ mod tests {
 		EntriesV3::from_blob(&raw)
 	}
 
-	/// `--leaf-align=panel32` semantics: every leaf contains entries whose
-	/// `tile_id` falls inside `[panel_start, panel_start + panel_size)`.
-	/// Root entries' `tile_id` are panel_start values (multiples of
-	/// panel_size).
+	/// `--leaf-align=panel32` semantics: every leaf contains entries from a
+	/// single `(z, x / panel_side, y / panel_side)` cell. Root entries'
+	/// `tile_id` is the smallest tile_id reachable in that cell.
+	///
+	/// Densely fills enough z=0..z=3 entries to span multiple panels at
+	/// `panel_side = 2` (panel_size = 4). At z=0..z=1 the grid fits in one
+	/// cell so each zoom contributes one leaf. At z=2 the 4×4 grid splits
+	/// into 4 panel-aligned cells. At z=3 the 8×8 grid splits into 16 cells.
 	#[test]
 	fn test_build_directory_panel_aligned_dense() -> Result<()> {
-		// Densely fill 4 panels of 8 entries each (panel_size = 8).
-		// Tile_ids 0..32 → 4 panels: [0..8), [8..16), [16..24), [24..32).
-		// Force leaves by using a trivially-tiny root budget (8 bytes).
-		let mut entries = create_filled_entries(32);
-		let directory = entries.build_directory(8, TileCompression::Uncompressed, Some(8))?;
+		// Tile_ids 0..85 cover all of z=0 (1) + z=1 (4) + z=2 (16) + z=3 (64).
+		let mut entries = create_filled_entries(85);
+		let directory = entries.build_directory(8, TileCompression::Uncompressed, Some(4))?;
 
-		// Root must have exactly 4 entries (one per panel), tile_ids = 0, 8, 16, 24.
 		let root = entries_from_blob(&directory.root_bytes, TileCompression::Uncompressed)?;
-		assert_eq!(root.len(), 4, "root must have one entry per panel");
-		let root_ids: Vec<u64> = root.iter().map(|e| e.tile_id).collect();
-		assert_eq!(root_ids, vec![0, 8, 16, 24]);
+		// Expected: 1 (z=0) + 1 (z=1) + 1 (z=2: grid 4×4 = 1 cell at panel_side=2... wait)
+		// Actually at panel_side=2: z=0 grid 1×1 → 1 cell. z=1 grid 2×2 → 1 cell.
+		// z=2 grid 4×4 → 4 cells. z=3 grid 8×8 → 16 cells. Total 1+1+4+16 = 22 leaves.
+		assert_eq!(root.len(), 22, "leaves: 1(z0) + 1(z1) + 4(z2) + 16(z3) = 22");
 
-		// Each root entry must be a leaf pointer (run_length == 0).
+		// Each root must be a leaf pointer, and roots must be sorted by tile_id.
+		let root_ids: Vec<u64> = root.iter().map(|e| e.tile_id).collect();
+		let mut sorted = root_ids.clone();
+		sorted.sort_unstable();
+		assert_eq!(root_ids, sorted, "root entries must be sorted by tile_id");
+
+		// First two leaves are the whole z=0 and z=1 zooms.
+		assert_eq!(root_ids[0], 0, "z=0 leaf root tile_id");
+		assert_eq!(root_ids[1], 1, "z=1 leaf root tile_id");
+		// At z=2 the four cells partition tile_ids 5..21 into 4-tile blocks.
+		assert_eq!(&root_ids[2..6], &[5, 9, 13, 17], "z=2 panel-cell roots");
+
 		for e in root.iter() {
 			assert_eq!(e.run_length, 0, "root entry {e:?} must be a leaf pointer");
 		}
 
-		// Walk leaves using each root entry's offset/length and verify entries
-		// fall in [panel_start, panel_start + 8).
+		// Cell consistency: every entry in a leaf shares (z, x/2, y/2).
 		for root_entry in root.iter() {
-			let panel_start = root_entry.tile_id;
-			let panel_end = panel_start + 8;
 			let leaf_bytes = directory
 				.leaves_bytes
 				.read_range(&root_entry.range)
 				.expect("leaf range within leaves_bytes");
 			let leaf = entries_from_blob(&leaf_bytes, TileCompression::Uncompressed)?;
-			assert!(leaf.len() > 0, "leaf for panel {panel_start} must have entries");
+			assert!(leaf.len() > 0, "leaf for root {root_entry:?} must have entries");
+			let first = TileCoord::from_hilbert_index(leaf.iter().next().unwrap().tile_id)?;
+			let expected_cell = (first.level, first.x / 2, first.y / 2);
 			for e in leaf.iter() {
-				assert!(
-					e.tile_id >= panel_start && e.tile_id < panel_end,
-					"leaf for panel {panel_start} has out-of-range entry {e:?}"
+				let coord = TileCoord::from_hilbert_index(e.tile_id)?;
+				let cell = (coord.level, coord.x / 2, coord.y / 2);
+				assert_eq!(
+					cell, expected_cell,
+					"all entries in one leaf must share (z, x/2, y/2)"
 				);
 			}
 		}
@@ -633,39 +738,49 @@ mod tests {
 		Ok(())
 	}
 
-	/// Sparse panel: a panel containing only a few entries should produce
-	/// a leaf with just those entries; the root entry's tile_id is still
-	/// the panel_start (NOT the first present entry's tile_id).
+	/// Sparse cell: a cell containing only a few entries should produce
+	/// a leaf with just those entries; the root entry's tile_id is the
+	/// cell-start (NOT the first present entry's tile_id) so lookups for
+	/// missing tile_ids in the cell still route to this leaf.
 	#[test]
 	fn test_build_directory_panel_aligned_sparse() -> Result<()> {
-		// Three entries: tile_ids 65, 70, 130. Panel size = 64.
-		// → panel starting at 64 (covers 64..128) contains 65 and 70
-		// → panel starting at 128 (covers 128..192) contains 130
+		// Pick a couple of z=6 tile_ids that land in different panel32 cells.
+		// At z=6 (64×64 grid, 2×2 panel32 cells) the 4 cells each cover 1024
+		// consecutive tile_ids starting at zoom_start(6)=1365.
+		// Cell roots in Hilbert order on the 2×2 panel grid: 1365, 2389, 3413, 4437.
+		// Tile (z=6, x=5, y=3) lives in cell (6, 0, 0) (5/32=0, 3/32=0).
+		// Tile (z=6, x=40, y=10) lives in cell (6, 1, 0).
+		let id_a = TileCoord::new(6, 5, 3)?.get_hilbert_index()?;
+		let id_b = TileCoord::new(6, 40, 10)?.get_hilbert_index()?;
 		let mut entries = EntriesV3::new();
-		entries.push(EntryV3::new(65, ByteRange::new(0, 100), 1));
-		entries.push(EntryV3::new(70, ByteRange::new(100, 100), 1));
-		entries.push(EntryV3::new(130, ByteRange::new(200, 100), 1));
+		entries.push(EntryV3::new(id_a, ByteRange::new(0, 100), 1));
+		entries.push(EntryV3::new(id_b, ByteRange::new(100, 100), 1));
 
-		let directory = entries.build_directory(8, TileCompression::Uncompressed, Some(64))?;
+		let directory = entries.build_directory(8, TileCompression::Uncompressed, Some(1024))?;
 
 		let root = entries_from_blob(&directory.root_bytes, TileCompression::Uncompressed)?;
-		assert_eq!(root.len(), 2, "two non-empty panels → two root entries");
+		assert_eq!(root.len(), 2, "two non-empty cells → two root entries");
 
 		let root_ids: Vec<u64> = root.iter().map(|e| e.tile_id).collect();
-		assert_eq!(
-			root_ids,
-			vec![64, 128],
-			"root entries' tile_ids must be panel_start, NOT the first present tile in each panel"
+		// Roots must be cell-starts (multiples of 1024 offset from zoom_start),
+		// NOT the first present tile_ids id_a / id_b.
+		assert!(
+			!root_ids.contains(&id_a) && !root_ids.contains(&id_b),
+			"root tile_ids must be cell-starts, not first-present tile_ids"
 		);
-
-		// First leaf has 2 entries (tile_ids 65, 70).
-		let leaf_bytes = directory
-			.leaves_bytes
-			.read_range(&root.iter().next().unwrap().range)
-			.unwrap();
-		let leaf = entries_from_blob(&leaf_bytes, TileCompression::Uncompressed)?;
-		let leaf_ids: Vec<u64> = leaf.iter().map(|e| e.tile_id).collect();
-		assert_eq!(leaf_ids, vec![65, 70]);
+		// The cell containing id_a is (6, 0, 0): cell-start = 1365 + 0*1024 = 1365.
+		// The cell containing id_b is (6, 1, 0): we cannot easily predict which
+		// of {1365, 2389, 3413, 4437} it is without computing the Hilbert
+		// index of (1, 0) at level 1, but it must be one of them.
+		let valid_cell_starts = [1365u64, 2389, 3413, 4437];
+		for r in &root_ids {
+			assert!(
+				valid_cell_starts.contains(r),
+				"root tile_id {r} must be one of {valid_cell_starts:?}"
+			);
+		}
+		// And the smallest must be 1365 (cell (6,0,0)).
+		assert_eq!(root_ids[0], 1365, "first cell at z=6 starts at zoom_start(6) = 1365");
 
 		Ok(())
 	}
@@ -695,6 +810,110 @@ mod tests {
 		}
 
 		assert_eq!(reconstructed, original, "round-trip must preserve every entry");
+		Ok(())
+	}
+
+	/// Low-zoom split: entries at z=0..z=6 with panel_side=32 must produce
+	/// exactly one leaf per low zoom (z=0,1,2,3,4,5) plus up to 4 leaves at
+	/// z=6 (since z=6's 64×64 grid splits into 2×2 panel-aligned cells).
+	///
+	/// This is the primary regression test for the bug where the previous
+	/// "slice by 1024-tile_id blocks" heuristic would have collapsed
+	/// z=0..z=4 (341 tile_ids) into one or two leaves spanning multiple
+	/// zooms — useless for `(z, panel32_x, panel32_y)` lookups.
+	#[test]
+	fn test_build_directory_panel_aligned_low_zoom_split() -> Result<()> {
+		// Fill all of z=0..z=6 = 1+4+16+64+256+1024+4096 = 5461 tile_ids.
+		let mut entries = create_filled_entries(5461);
+		let directory = entries.build_directory(8, TileCompression::Uncompressed, Some(1024))?;
+
+		let root = entries_from_blob(&directory.root_bytes, TileCompression::Uncompressed)?;
+
+		// Group leaves by zoom and count entries.
+		let mut zoom_leaf_sizes: std::collections::BTreeMap<u8, Vec<u64>> = std::collections::BTreeMap::new();
+		for root_entry in root.iter() {
+			let leaf_bytes = directory.leaves_bytes.read_range(&root_entry.range).unwrap();
+			let leaf = entries_from_blob(&leaf_bytes, TileCompression::Uncompressed)?;
+			let z = TileCoord::from_hilbert_index(leaf.iter().next().unwrap().tile_id)?.level;
+			zoom_leaf_sizes.entry(z).or_default().push(leaf.len() as u64);
+		}
+
+		// z=0..z=4: each whole zoom is one leaf with 1, 4, 16, 64, 256 entries.
+		assert_eq!(zoom_leaf_sizes.get(&0), Some(&vec![1u64]), "z=0 → 1 leaf of 1 entry");
+		assert_eq!(zoom_leaf_sizes.get(&1), Some(&vec![4u64]), "z=1 → 1 leaf of 4 entries");
+		assert_eq!(zoom_leaf_sizes.get(&2), Some(&vec![16u64]), "z=2 → 1 leaf of 16 entries");
+		assert_eq!(zoom_leaf_sizes.get(&3), Some(&vec![64u64]), "z=3 → 1 leaf of 64 entries");
+		assert_eq!(zoom_leaf_sizes.get(&4), Some(&vec![256u64]), "z=4 → 1 leaf of 256 entries");
+		// z=5: 32×32 grid = 1 panel32 cell → 1 leaf of 1024 entries.
+		assert_eq!(zoom_leaf_sizes.get(&5), Some(&vec![1024u64]), "z=5 → 1 leaf of 1024 entries");
+		// z=6: 64×64 grid = 4 panel32 cells → 4 leaves of 1024 entries each.
+		assert_eq!(
+			zoom_leaf_sizes.get(&6),
+			Some(&vec![1024u64, 1024, 1024, 1024]),
+			"z=6 → 4 leaves of 1024 entries each"
+		);
+
+		Ok(())
+	}
+
+	/// z=5 boundary: an archive of all 1024 z=5 tile_ids must produce
+	/// exactly ONE leaf. The buggy "slice by arithmetic 1024-tile_id blocks"
+	/// heuristic produced 2 leaves here because the first block (panel_start
+	/// 0) spans z=0..z=4 (341 tiles) plus the first 683 tiles of z=5,
+	/// leaving the remaining 341 z=5 tiles in a second block.
+	#[test]
+	fn test_build_directory_panel_aligned_z5_single_leaf() -> Result<()> {
+		// All 1024 z=5 tile_ids, in tile_id order. zoom_start(5) = 341.
+		let mut entries = EntriesV3::new();
+		for tid in 341u64..(341 + 1024) {
+			entries.push(EntryV3::new(tid, ByteRange::new(tid * 100, 100), 1));
+		}
+
+		let directory = entries.build_directory(8, TileCompression::Uncompressed, Some(1024))?;
+		let root = entries_from_blob(&directory.root_bytes, TileCompression::Uncompressed)?;
+
+		assert_eq!(root.len(), 1, "all of z=5 must collapse to exactly 1 leaf");
+		assert_eq!(
+			root.iter().next().unwrap().tile_id,
+			341,
+			"z=5 leaf root tile_id must be zoom_start(5) = 341"
+		);
+
+		// Sanity: the leaf contains all 1024 entries with the right tile_ids.
+		let leaf_bytes = directory.leaves_bytes.read_range(&root.iter().next().unwrap().range).unwrap();
+		let leaf = entries_from_blob(&leaf_bytes, TileCompression::Uncompressed)?;
+		assert_eq!(leaf.len(), 1024, "z=5 leaf must hold all 1024 z=5 entries");
+		Ok(())
+	}
+
+	/// Cell consistency: for every leaf produced by the panel-aligned packer,
+	/// every entry in that leaf shares the same `(z, x / panel_side, y / panel_side)`.
+	/// This is the core invariant the bug fix establishes.
+	#[test]
+	fn test_build_directory_panel_aligned_cell_consistency() -> Result<()> {
+		// A non-trivial archive that exercises both the low-zoom collapse path
+		// (z<5) and the panel-cell path (z>=5).
+		let mut entries = create_filled_entries(2000); // spans z=0..z=5 partial
+		let directory = entries.build_directory(8, TileCompression::Uncompressed, Some(1024))?;
+		let root = entries_from_blob(&directory.root_bytes, TileCompression::Uncompressed)?;
+
+		assert!(root.len() > 1, "test must produce multiple leaves to be meaningful");
+
+		for root_entry in root.iter() {
+			let leaf_bytes = directory.leaves_bytes.read_range(&root_entry.range).unwrap();
+			let leaf = entries_from_blob(&leaf_bytes, TileCompression::Uncompressed)?;
+			let first_coord = TileCoord::from_hilbert_index(leaf.iter().next().unwrap().tile_id)?;
+			let expected_cell = (first_coord.level, first_coord.x / 32, first_coord.y / 32);
+			for e in leaf.iter() {
+				let coord = TileCoord::from_hilbert_index(e.tile_id)?;
+				let cell = (coord.level, coord.x / 32, coord.y / 32);
+				assert_eq!(
+					cell, expected_cell,
+					"leaf rooted at tile_id {} contains entry {e:?} from a different cell",
+					root_entry.tile_id
+				);
+			}
+		}
 		Ok(())
 	}
 }

@@ -31,9 +31,10 @@ pub struct RuntimeInner {
 	/// the panel-pmtiles format with value `64`). Sentinel `0` = unset.
 	pub pmtiles_dedup_scope: AtomicU64,
 	/// PMTiles writer config: when non-zero, the leaf-packing path slices
-	/// entries by tile_id range `[panel_start, panel_start + N)` instead of
-	/// by entry-count budget (used by the panel-pmtiles format with value
-	/// `1024` = panel[32]). Sentinel `0` = unset.
+	/// entries so each leaf covers exactly one `(z, x / panel_side, y / panel_side)`
+	/// cell, where `panel_side² = N` (must be a perfect square power-of-two).
+	/// Used by the panel-pmtiles format with value `1024` = panel[32]
+	/// (panel_side=32). Sentinel `0` = unset.
 	pub pmtiles_leaf_align: AtomicU64,
 }
 
