@@ -138,10 +138,23 @@ impl EntriesV3 {
 	/// # Arguments
 	/// * `target_root_len` - The maximum size of the root directory in bytes.
 	/// * `compression` - The compression method to be applied.
+	/// * `leaf_align` - Optional panel size. When `Some(N)`, the leaf-packing
+	///   path slices entries by tile_id range `[panel_start, panel_start + N)`
+	///   instead of by entry-count budget. Each leaf contains entries whose
+	///   tile_ids fall in one such panel; root entries' tile_ids are
+	///   panel_start values (NOT the first present entry in each panel).
+	///   Used by the panel-pmtiles format (panel_size = 1024 = panel[32]).
+	///   When `None`, packs leaves by byte-budget (the original upstream
+	///   behaviour).
 	///
 	/// # Errors
 	/// Returns an error if the entries cannot be serialized or compressed as specified.
-	pub fn build_directory(&mut self, target_root_len: u64, compression: TileCompression) -> Result<Directory> {
+	pub fn build_directory(
+		&mut self,
+		target_root_len: u64,
+		compression: TileCompression,
+		leaf_align: Option<u64>,
+	) -> Result<Directory> {
 		self.entries.sort_by_cached_key(|e| e.tile_id);
 		let entries: &EntriesSliceV3 = &self.as_slice();
 
@@ -159,8 +172,14 @@ impl EntriesV3 {
 		// TODO: case 2: mixed tile entries/directory entries in root
 
 		// case 3: root directory is leaf pointers only
-		// use an iterative method, increasing the size of the leaf directory until the root fits
+		if let Some(panel_size) = leaf_align {
+			// Panel-aligned path: each leaf covers exactly one panel of
+			// `panel_size` consecutive Hilbert tile_ids. Deterministic — root
+			// size is a function of how many non-empty panels exist.
+			return build_roots_leaves_panel_aligned(entries, panel_size, compression);
+		}
 
+		// Default path: iterative leaf-size growth until the root fits.
 		let mut leaf_size: f32 = (entries.len() as f32 / 3500f32).max(4096f32);
 
 		loop {
@@ -195,6 +214,54 @@ impl EntriesV3 {
 				leaves_bytes.write_all(serialized.as_slice())?;
 
 				idx += leaf_size;
+			}
+
+			let root_bytes = compress(root_entries.as_slice().serialize_entries()?, &compression)?;
+
+			Ok(Directory {
+				root_bytes,
+				leaves_bytes: Blob::from(leaves_bytes),
+			})
+		}
+
+		/// Panel-aligned leaf packing: each leaf holds entries whose tile_id
+		/// falls in `[panel_start, panel_start + panel_size)`. Root entries
+		/// use `panel_start` as their tile_id (NOT the first present entry's
+		/// tile_id) so PMTiles' "find largest entry with tile_id ≤ target"
+		/// lookup correctly hits this leaf for any target tile_id in the
+		/// panel range — including sparse-panel cases where the first present
+		/// entry is far into the panel.
+		fn build_roots_leaves_panel_aligned(
+			entries: &EntriesSliceV3,
+			panel_size: u64,
+			compression: TileCompression,
+		) -> Result<Directory> {
+			let mut root_entries = EntriesV3::new();
+			let mut leaves_bytes: Vec<u8> = Vec::new();
+
+			let mut idx: usize = 0;
+			while idx < entries.len() {
+				// Panel containing entries[idx].
+				let panel_start = (entries.get(idx).tile_id / panel_size) * panel_size;
+				let panel_end = panel_start + panel_size;
+
+				// Find the first index whose tile_id is >= panel_end. All
+				// entries in [idx, end) belong to this panel.
+				let mut end = idx + 1;
+				while end < entries.len() && entries.get(end).tile_id < panel_end {
+					end += 1;
+				}
+
+				let serialized = compress(entries.slice(idx..end).serialize_entries()?, &compression)?;
+
+				root_entries.push(EntryV3::new(
+					panel_start, // NOT entries[idx].tile_id — see doc comment
+					ByteRange::new(leaves_bytes.len() as u64, serialized.len() as u64),
+					0,
+				));
+				leaves_bytes.write_all(serialized.as_slice())?;
+
+				idx = end;
 			}
 
 			let root_bytes = compress(root_entries.as_slice().serialize_entries()?, &compression)?;
@@ -370,7 +437,7 @@ mod tests {
 	#[test]
 	fn test_build_directory() -> Result<()> {
 		let mut entries = create_entries();
-		let directory = entries.build_directory(1000, TileCompression::Uncompressed)?; // Assuming 1000 is enough size for root
+		let directory = entries.build_directory(1000, TileCompression::Uncompressed, None)?; // Assuming 1000 is enough size for root
 		assert!(!directory.root_bytes.is_empty());
 		Ok(())
 	}
@@ -500,7 +567,7 @@ mod tests {
 	#[test]
 	fn test_build_directory_structure() -> Result<()> {
 		let mut entries = create_filled_entries(500); // A reasonable number of entries for testing
-		let directory = entries.build_directory(1024, TileCompression::Uncompressed)?; // Assuming a small root directory size
+		let directory = entries.build_directory(1024, TileCompression::Uncompressed, None)?; // Assuming a small root directory size
 
 		assert!(
 			!directory.root_bytes.is_empty(),
@@ -511,6 +578,123 @@ mod tests {
 			"Directory leaves bytes should be non-zero for valid entries"
 		);
 
+		Ok(())
+	}
+
+	// Helper: deserialize a directory blob into entries.
+	fn entries_from_blob(blob: &Blob, compression: TileCompression) -> Result<EntriesV3> {
+		use versatiles_core::compression::decompress;
+		let raw = decompress(blob.clone(), &compression)?;
+		EntriesV3::from_blob(&raw)
+	}
+
+	/// `--leaf-align=panel32` semantics: every leaf contains entries whose
+	/// `tile_id` falls inside `[panel_start, panel_start + panel_size)`.
+	/// Root entries' `tile_id` are panel_start values (multiples of
+	/// panel_size).
+	#[test]
+	fn test_build_directory_panel_aligned_dense() -> Result<()> {
+		// Densely fill 4 panels of 8 entries each (panel_size = 8).
+		// Tile_ids 0..32 → 4 panels: [0..8), [8..16), [16..24), [24..32).
+		// Force leaves by using a trivially-tiny root budget (8 bytes).
+		let mut entries = create_filled_entries(32);
+		let directory = entries.build_directory(8, TileCompression::Uncompressed, Some(8))?;
+
+		// Root must have exactly 4 entries (one per panel), tile_ids = 0, 8, 16, 24.
+		let root = entries_from_blob(&directory.root_bytes, TileCompression::Uncompressed)?;
+		assert_eq!(root.len(), 4, "root must have one entry per panel");
+		let root_ids: Vec<u64> = root.iter().map(|e| e.tile_id).collect();
+		assert_eq!(root_ids, vec![0, 8, 16, 24]);
+
+		// Each root entry must be a leaf pointer (run_length == 0).
+		for e in root.iter() {
+			assert_eq!(e.run_length, 0, "root entry {e:?} must be a leaf pointer");
+		}
+
+		// Walk leaves using each root entry's offset/length and verify entries
+		// fall in [panel_start, panel_start + 8).
+		for root_entry in root.iter() {
+			let panel_start = root_entry.tile_id;
+			let panel_end = panel_start + 8;
+			let leaf_bytes = directory
+				.leaves_bytes
+				.read_range(&root_entry.range)
+				.expect("leaf range within leaves_bytes");
+			let leaf = entries_from_blob(&leaf_bytes, TileCompression::Uncompressed)?;
+			assert!(leaf.len() > 0, "leaf for panel {panel_start} must have entries");
+			for e in leaf.iter() {
+				assert!(
+					e.tile_id >= panel_start && e.tile_id < panel_end,
+					"leaf for panel {panel_start} has out-of-range entry {e:?}"
+				);
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Sparse panel: a panel containing only a few entries should produce
+	/// a leaf with just those entries; the root entry's tile_id is still
+	/// the panel_start (NOT the first present entry's tile_id).
+	#[test]
+	fn test_build_directory_panel_aligned_sparse() -> Result<()> {
+		// Three entries: tile_ids 65, 70, 130. Panel size = 64.
+		// → panel starting at 64 (covers 64..128) contains 65 and 70
+		// → panel starting at 128 (covers 128..192) contains 130
+		let mut entries = EntriesV3::new();
+		entries.push(EntryV3::new(65, ByteRange::new(0, 100), 1));
+		entries.push(EntryV3::new(70, ByteRange::new(100, 100), 1));
+		entries.push(EntryV3::new(130, ByteRange::new(200, 100), 1));
+
+		let directory = entries.build_directory(8, TileCompression::Uncompressed, Some(64))?;
+
+		let root = entries_from_blob(&directory.root_bytes, TileCompression::Uncompressed)?;
+		assert_eq!(root.len(), 2, "two non-empty panels → two root entries");
+
+		let root_ids: Vec<u64> = root.iter().map(|e| e.tile_id).collect();
+		assert_eq!(
+			root_ids,
+			vec![64, 128],
+			"root entries' tile_ids must be panel_start, NOT the first present tile in each panel"
+		);
+
+		// First leaf has 2 entries (tile_ids 65, 70).
+		let leaf_bytes = directory
+			.leaves_bytes
+			.read_range(&root.iter().next().unwrap().range)
+			.unwrap();
+		let leaf = entries_from_blob(&leaf_bytes, TileCompression::Uncompressed)?;
+		let leaf_ids: Vec<u64> = leaf.iter().map(|e| e.tile_id).collect();
+		assert_eq!(leaf_ids, vec![65, 70]);
+
+		Ok(())
+	}
+
+	/// Round-trip integrity: every input entry can be looked up via the
+	/// directory exactly as before.
+	#[test]
+	fn test_build_directory_panel_aligned_roundtrip() -> Result<()> {
+		let mut entries = create_filled_entries(100);
+		// Snapshot the entries list before build_directory consumes self.entries.
+		let original: Vec<EntryV3> = entries.entries.clone();
+
+		let directory = entries.build_directory(8, TileCompression::Uncompressed, Some(16))?;
+
+		// Walk root → leaves and reconstruct the full entry list.
+		let root = entries_from_blob(&directory.root_bytes, TileCompression::Uncompressed)?;
+		let mut reconstructed: Vec<EntryV3> = Vec::new();
+		for root_entry in root.iter() {
+			let leaf_bytes = directory
+				.leaves_bytes
+				.read_range(&root_entry.range)
+				.unwrap();
+			let leaf = entries_from_blob(&leaf_bytes, TileCompression::Uncompressed)?;
+			for e in leaf.iter() {
+				reconstructed.push(*e);
+			}
+		}
+
+		assert_eq!(reconstructed, original, "round-trip must preserve every entry");
 		Ok(())
 	}
 }

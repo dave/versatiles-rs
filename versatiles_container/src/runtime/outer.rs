@@ -121,6 +121,40 @@ impl TilesRuntime {
 		self.inner.abort_on_error.store(abort, Ordering::Relaxed);
 	}
 
+	/// PMTiles writer config: dedup-scope panel size in tiles. Returns
+	/// `None` when unset (default — full archive-wide dedup).
+	#[must_use]
+	pub fn pmtiles_dedup_scope(&self) -> Option<u64> {
+		match self.inner.pmtiles_dedup_scope.load(Ordering::Relaxed) {
+			0 => None,
+			n => Some(n),
+		}
+	}
+
+	/// PMTiles writer config: leaf-alignment panel size in tiles. Returns
+	/// `None` when unset (default — byte-budget leaf packing).
+	#[must_use]
+	pub fn pmtiles_leaf_align(&self) -> Option<u64> {
+		match self.inner.pmtiles_leaf_align.load(Ordering::Relaxed) {
+			0 => None,
+			n => Some(n),
+		}
+	}
+
+	/// Set the PMTiles dedup-scope panel size. The CLI's `convert`
+	/// subcommand calls this when `--dedup-scope=panel8` is passed (with
+	/// value `64`). `0` means "unset / use default".
+	pub fn set_pmtiles_dedup_scope(&self, panel_size: u64) {
+		self.inner.pmtiles_dedup_scope.store(panel_size, Ordering::Relaxed);
+	}
+
+	/// Set the PMTiles leaf-alignment panel size. The CLI's `convert`
+	/// subcommand calls this when `--leaf-align=panel32` is passed (with
+	/// value `1024`). `0` means "unset / use default".
+	pub fn set_pmtiles_leaf_align(&self, panel_size: u64) {
+		self.inner.pmtiles_leaf_align.store(panel_size, Ordering::Relaxed);
+	}
+
 	/// Create a progress bar for tracking operations
 	///
 	/// Progress bars emit events through the event bus and can be monitored

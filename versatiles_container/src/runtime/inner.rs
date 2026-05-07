@@ -4,7 +4,7 @@ use std::{
 	path::PathBuf,
 	sync::{
 		Mutex,
-		atomic::{AtomicBool, AtomicUsize},
+		atomic::{AtomicBool, AtomicU64, AtomicUsize},
 	},
 };
 
@@ -26,6 +26,15 @@ pub struct RuntimeInner {
 	/// Count of errors recorded via `TilesRuntime::record_error`. Producers
 	/// can inspect this after a stream drains to detect silent drops.
 	pub error_count: AtomicUsize,
+	/// PMTiles writer config: when non-zero, the blob-dedup map is reset at
+	/// every multiple of this many tiles in Hilbert tile_id order (used by
+	/// the panel-pmtiles format with value `64`). Sentinel `0` = unset.
+	pub pmtiles_dedup_scope: AtomicU64,
+	/// PMTiles writer config: when non-zero, the leaf-packing path slices
+	/// entries by tile_id range `[panel_start, panel_start + N)` instead of
+	/// by entry-count budget (used by the panel-pmtiles format with value
+	/// `1024` = panel[32]). Sentinel `0` = unset.
+	pub pmtiles_leaf_align: AtomicU64,
 }
 
 #[cfg(test)]
@@ -47,6 +56,8 @@ mod tests {
 			progress_factory,
 			abort_on_error: AtomicBool::new(false),
 			error_count: AtomicUsize::new(0),
+			pmtiles_dedup_scope: AtomicU64::new(0),
+			pmtiles_leaf_align: AtomicU64::new(0),
 		};
 
 		assert_eq!(inner.cache_type, CacheType::InMemory);
@@ -68,6 +79,8 @@ mod tests {
 			progress_factory,
 			abort_on_error: AtomicBool::new(false),
 			error_count: AtomicUsize::new(0),
+			pmtiles_dedup_scope: AtomicU64::new(0),
+			pmtiles_leaf_align: AtomicU64::new(0),
 		};
 
 		assert_eq!(inner.cache_type, CacheType::Disk(path_buf));
@@ -88,6 +101,8 @@ mod tests {
 			progress_factory,
 			abort_on_error: AtomicBool::new(false),
 			error_count: AtomicUsize::new(0),
+			pmtiles_dedup_scope: AtomicU64::new(0),
+			pmtiles_leaf_align: AtomicU64::new(0),
 		};
 
 		// Verify we can lock and access the progress factory
@@ -111,6 +126,8 @@ mod tests {
 			progress_factory,
 			abort_on_error: AtomicBool::new(false),
 			error_count: AtomicUsize::new(0),
+			pmtiles_dedup_scope: AtomicU64::new(0),
+			pmtiles_leaf_align: AtomicU64::new(0),
 		};
 
 		// Verify event bus works

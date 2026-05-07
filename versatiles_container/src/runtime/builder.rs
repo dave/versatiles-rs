@@ -6,7 +6,7 @@ use std::{
 	path::PathBuf,
 	sync::{
 		Arc, Mutex,
-		atomic::{AtomicBool, AtomicUsize},
+		atomic::{AtomicBool, AtomicU64, AtomicUsize},
 	},
 };
 
@@ -149,6 +149,8 @@ impl RuntimeBuilder {
 				progress_factory,
 				abort_on_error: AtomicBool::new(self.abort_on_error),
 				error_count: AtomicUsize::new(0),
+				pmtiles_dedup_scope: AtomicU64::new(0),
+				pmtiles_leaf_align: AtomicU64::new(0),
 			}),
 		}
 	}

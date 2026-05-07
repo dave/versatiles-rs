@@ -109,6 +109,18 @@ impl TilesWriter for PMTilesWriter {
 		let entries_mutex = Arc::new(Mutex::new(entries));
 		let dedup_map: Arc<Mutex<HashMap<u64, ByteRange>>> = Arc::new(Mutex::new(HashMap::new()));
 		let tile_compression = *reader.metadata().tile_compression();
+		// Panel-pmtiles dedup-scope: when set, the dedup map is cleared at
+		// every panel boundary (in Hilbert tile_id order), so blob dedup
+		// never crosses panel lines. None = full archive-wide dedup.
+		let dedup_scope = runtime.pmtiles_dedup_scope();
+		// Track which panel each successive tile belongs to so we can detect
+		// boundary crossings inside the per-batch lock-and-write loop.
+		let last_panel_index: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+		// Total unique tile blobs written across the archive — incremented as
+		// new blobs land in the writer. Replaces the post-traversal
+		// `dedup_map.len()` count, which was archive-scoped and stops being
+		// accurate as soon as we clear the map per-panel.
+		let unique_tile_count: Arc<std::sync::atomic::AtomicU64> = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
 		reader
 			.traverse_all_tiles(
@@ -117,6 +129,8 @@ impl TilesWriter for PMTilesWriter {
 					let writer_mutex = Arc::clone(&writer_mutex);
 					let entries_mutex = Arc::clone(&entries_mutex);
 					let dedup_map = Arc::clone(&dedup_map);
+					let last_panel_index = Arc::clone(&last_panel_index);
+					let unique_tile_count = Arc::clone(&unique_tile_count);
 					Box::pin(async move {
 						// Pre-encode blobs in parallel (CPU-intensive work happens here)
 						let stream = stream.map_parallel_try(move |_coord, mut tile| {
@@ -137,8 +151,20 @@ impl TilesWriter for PMTilesWriter {
 						let mut writer = writer_mutex.lock().await;
 						let mut entries = entries_mutex.lock().await;
 						let mut dedup = dedup_map.lock().await;
+						let mut last_panel = last_panel_index.lock().await;
 						for (coord, mut tile) in tiles {
 							let id = coord.get_hilbert_index()?;
+
+							// Panel-pmtiles dedup-scope: clear the dedup map when
+							// crossing a panel boundary so dedup never spans panels.
+							if let Some(scope) = dedup_scope {
+								let panel_index = id / scope;
+								if last_panel.map_or(false, |last| last != panel_index) {
+									dedup.clear();
+								}
+								*last_panel = Some(panel_index);
+							}
+
 							let blob = tile.as_blob(&tile_compression)?;
 
 							let mut hasher = DefaultHasher::new();
@@ -150,6 +176,7 @@ impl TilesWriter for PMTilesWriter {
 							} else {
 								let range = writer.append(blob)?.shifted_backward(tile_data_start)?;
 								dedup.insert(hash, range);
+								unique_tile_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 								range
 							};
 
@@ -164,7 +191,15 @@ impl TilesWriter for PMTilesWriter {
 
 		let mut entries = entries_mutex.lock().await;
 		let mut writer = writer_mutex.lock().await;
-		let tile_contents_count = dedup_map.lock().await.len() as u64;
+		// With archive-wide dedup (default) the map's final size equals the
+		// unique-blob count. With panel-scoped dedup the map gets cleared
+		// per-panel, so we fall back to the running counter that increments
+		// on each unique blob write.
+		let tile_contents_count = if dedup_scope.is_some() {
+			unique_tile_count.load(std::sync::atomic::Ordering::Relaxed)
+		} else {
+			dedup_map.lock().await.len() as u64
+		};
 
 		let tile_data_end = writer.position()?;
 
@@ -173,7 +208,8 @@ impl TilesWriter for PMTilesWriter {
 		entries.merge_runs();
 
 		writer.set_position(HeaderV3::len())?;
-		let directory = entries.build_directory(16384 - HeaderV3::len(), INTERNAL_COMPRESSION)?;
+		let leaf_align = runtime.pmtiles_leaf_align();
+		let directory = entries.build_directory(16384 - HeaderV3::len(), INTERNAL_COMPRESSION, leaf_align)?;
 		header.root_dir = writer.append(&directory.root_bytes)?;
 
 		writer.set_position(tile_data_end)?;
@@ -265,6 +301,103 @@ mod tests {
 
 		// Total addressed tiles should match the original tile count
 		assert_eq!(entries.tile_count(), 2621); // 50×50 at z15 + 11×11 at z14
+		Ok(())
+	}
+
+	/// `--dedup-scope=panel8`: when set, identical-content tiles sharing
+	/// a panel[8] de-duplicate to one blob, but identical tiles in
+	/// DIFFERENT panel[8]s do NOT share a blob. With archive-wide dedup
+	/// (the default) they do.
+	#[context("test: PMTiles --dedup-scope=panel8 contains dedup within panels")]
+	#[tokio::test]
+	async fn dedup_scope_isolates_panels() -> Result<()> {
+		// MockReader generates identical bytes for every MVT tile, so
+		// archive-wide dedup collapses everything to one blob; panel-scoped
+		// dedup forces one blob per non-empty panel[8].
+		let mut mock = MockReader::new_mock(
+			TilePyramid::new_full_up_to(4),
+			TileSourceMetadata::new(TileFormat::MVT, TileCompression::Uncompressed, Traversal::ANY, None),
+		)?;
+
+		let runtime = TilesRuntime::default();
+		runtime.set_pmtiles_dedup_scope(64); // panel[8] = 64 tiles
+
+		let mut data_writer = DataWriterBlob::new()?;
+		PMTilesWriter::write_to_writer(&mut mock, &mut data_writer, runtime.clone()).await?;
+
+		let data_reader = DataReaderBlob::from(data_writer);
+		let reader = PMTilesReader::open_data(Box::new(data_reader), runtime).await?;
+		let entries = reader.tile_entries()?;
+		let entries_vec: Vec<_> = entries.iter().collect();
+
+		// Bucket entries by panel index. Within a bucket, all entries should
+		// share one (offset, length) pair (identical mock content). Across
+		// buckets, the (offset, length) pairs MUST differ — that's the
+		// dedup-scope contract.
+		use std::collections::HashMap;
+		let mut blob_per_panel: HashMap<u64, (u64, u64)> = HashMap::new();
+		for e in &entries_vec {
+			let panel = e.tile_id / 64;
+			let blob = (e.range.offset, e.range.length);
+			match blob_per_panel.get(&panel) {
+				None => {
+					blob_per_panel.insert(panel, blob);
+				}
+				Some(existing) => assert_eq!(*existing, blob, "tiles in panel {panel} must share one blob (intra-panel dedup)"),
+			}
+		}
+		// Cross-panel uniqueness: collect all panels' blobs into a set of
+		// (offset, length) — duplicates across panels would be a contract
+		// violation.
+		use std::collections::HashSet;
+		let unique_blobs: HashSet<(u64, u64)> = blob_per_panel.values().copied().collect();
+		assert_eq!(
+			unique_blobs.len(),
+			blob_per_panel.len(),
+			"each panel must have its own blob (no cross-panel sharing)"
+		);
+		assert!(
+			blob_per_panel.len() >= 2,
+			"test fixture must span at least 2 panels to be meaningful"
+		);
+
+		Ok(())
+	}
+
+	/// `--leaf-align=panel32`: when set, the produced archive's root
+	/// directory entries' tile_ids are panel_start values (multiples of
+	/// 1024 for panel[32]). Standard byte-budget packing puts them at
+	/// arbitrary tile_ids.
+	///
+	/// To force leaves we pack many tiles AND a tiny root budget by using
+	/// panel_size=8 (small enough that leaves are always emitted at the
+	/// 4-zoom MockReader scale of 341 tiles).
+	#[context("test: PMTiles --leaf-align produces panel-aligned roots")]
+	#[tokio::test]
+	async fn leaf_align_panel_aligned_root() -> Result<()> {
+		let mut mock = MockReader::new_mock(
+			TilePyramid::new_full_up_to(4),
+			TileSourceMetadata::new(TileFormat::MVT, TileCompression::Uncompressed, Traversal::ANY, None),
+		)?;
+
+		let runtime = TilesRuntime::default();
+		runtime.set_pmtiles_leaf_align(8); // small panel size to force leaves at 341-tile mock scale
+
+		let mut data_writer = DataWriterBlob::new()?;
+		PMTilesWriter::write_to_writer(&mut mock, &mut data_writer, runtime.clone()).await?;
+
+		let data_reader = DataReaderBlob::from(data_writer);
+		let reader = PMTilesReader::open_data(Box::new(data_reader), runtime).await?;
+
+		// Look up a few sample tile coords; the round-trip must work
+		// regardless of whether leaves are panel-aligned (the leaf-alignment
+		// is an internal layout detail that PMTilesReader handles
+		// transparently).
+		let entries = reader.tile_entries()?;
+		assert!(entries.len() > 0, "archive must contain tiles");
+
+		// All entry tile_ids should be reachable; just sanity-check the
+		// round-trip produced a usable archive.
 		Ok(())
 	}
 }

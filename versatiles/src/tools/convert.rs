@@ -97,6 +97,56 @@ pub struct Subcommand {
 	/// set the output tile format, e.g. "webp", "webp,80", "avif,90,50"
 	#[arg(long, value_name = "format[,quality][,effort]", display_order = 3)]
 	tile_format: Option<String>,
+
+	/// PMTiles output only: scope blob deduplication to consecutive
+	/// `panel8` blocks of 64 Hilbert-ordered tiles. The dedup map is
+	/// reset at every panel[8] boundary, so identical-content tiles in
+	/// different panel[8]s do NOT share a blob. Used by the panel-pmtiles
+	/// format to keep any panel-aligned tile_id range mapped to a
+	/// contiguous tile_data byte range.
+	#[arg(long, value_enum, display_order = 4)]
+	dedup_scope: Option<DedupScope>,
+
+	/// PMTiles output only: pack leaf directories so each leaf covers
+	/// exactly one `panel32` (1024 tiles) of consecutive Hilbert tile_ids,
+	/// aligned to panel[32] boundaries. Root entries' tile_ids are
+	/// panel_start values. Without this flag the encoder packs leaves
+	/// to fit a byte budget (upstream default), which doesn't align with
+	/// any tile_id grid.
+	#[arg(long, value_enum, display_order = 4)]
+	leaf_align: Option<LeafAlign>,
+}
+
+/// CLI value for `--dedup-scope`.
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+pub enum DedupScope {
+	/// 64 tiles (8×8 panel of Hilbert-consecutive ids).
+	Panel8,
+}
+
+impl DedupScope {
+	/// Tile count covered by this dedup scope.
+	pub fn tile_count(self) -> u64 {
+		match self {
+			DedupScope::Panel8 => 64,
+		}
+	}
+}
+
+/// CLI value for `--leaf-align`.
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+pub enum LeafAlign {
+	/// 1024 tiles (32×32 panel of Hilbert-consecutive ids).
+	Panel32,
+}
+
+impl LeafAlign {
+	/// Tile count covered by this leaf alignment.
+	pub fn tile_count(self) -> u64 {
+		match self {
+			LeafAlign::Panel32 => 1024,
+		}
+	}
 }
 
 #[tokio::main]
@@ -106,6 +156,15 @@ pub async fn run(arguments: &Subcommand, runtime: &TilesRuntime) -> Result<()> {
 	// Conversion must fail loudly on any silently-dropped tile: a truncated
 	// output would be indistinguishable from a successful conversion.
 	runtime.set_abort_on_error(true);
+
+	// Panel-pmtiles flags. Both apply only to PMTiles output; non-PMTiles
+	// writers ignore them.
+	if let Some(scope) = arguments.dedup_scope {
+		runtime.set_pmtiles_dedup_scope(scope.tile_count());
+	}
+	if let Some(align) = arguments.leaf_align {
+		runtime.set_pmtiles_leaf_align(align.tile_count());
+	}
 
 	let reader = runtime.reader_from_str(&arguments.input_file).await?;
 
