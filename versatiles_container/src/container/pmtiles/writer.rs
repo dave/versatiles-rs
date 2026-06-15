@@ -93,7 +93,14 @@ impl TilesWriter for PMTilesWriter {
 
 		let entries = EntriesV3::new();
 
-		writer.set_position(16384)?;
+		// Reserve only the 127-byte header at the front; it is backfilled last
+		// via `write_start`. Metadata, tile data, and the directories all get
+		// appended after it. NB: there is deliberately NO fixed root-directory
+		// reserve here — the root is written at the END of the file (see the
+		// directory-write block below). A fixed front reserve (previously
+		// 16384) silently overran into metadata + tile data whenever the
+		// `--leaf-align` root grew past it, corrupting the low-zoom tiles.
+		writer.set_position(HeaderV3::len())?;
 
 		let tilejson = reader.tilejson();
 		let tile_pyramid = reader.tile_pyramid().await?;
@@ -207,13 +214,21 @@ impl TilesWriter for PMTilesWriter {
 
 		entries.merge_runs();
 
-		writer.set_position(HeaderV3::len())?;
 		let leaf_align = runtime.pmtiles_leaf_align();
 		let directory = entries.build_directory(16384 - HeaderV3::len(), INTERNAL_COMPRESSION, leaf_align)?;
-		header.root_dir = writer.append(&directory.root_bytes)?;
 
+		// Write both directories at the END of the file, after the tile data.
+		// With `--leaf-align` the root holds one entry per panel cell, so for
+		// world-scale archives it can far exceed any fixed front reserve.
+		// Writing it into a fixed 16 KiB slot at offset 127 (the previous
+		// behaviour) overran into metadata + the first tiles and corrupted the
+		// low-zoom tiles. Appending here lets the root be any size; the header
+		// (backfilled below via `write_start`) carries the real offsets, so
+		// every spec-compliant reader follows the pointer regardless of where
+		// the root physically lives.
 		writer.set_position(tile_data_end)?;
 		header.leaf_dirs = writer.append(&directory.leaves_bytes)?;
+		header.root_dir = writer.append(&directory.root_bytes)?;
 
 		header.clustered = true;
 		header.internal_compression = PMTilesCompression::from_value(INTERNAL_COMPRESSION)?;
