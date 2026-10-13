@@ -39,7 +39,7 @@
 //! ## Errors
 //! Returns errors if writing, compression, or serialization fails.
 
-use super::types::{EntriesV3, EntryV3, HeaderV3, PMTilesCompression};
+use super::types::{EntriesV3, EntryV3, HeaderV3, PMTilesCompression, zoom_relative_panel};
 use crate::{
 	TileSource, TileSourceTraverseExt, TilesRuntime, TilesWriter,
 	traversal::{Traversal, TraversalOrder},
@@ -122,7 +122,11 @@ impl TilesWriter for PMTilesWriter {
 		let dedup_scope = runtime.pmtiles_dedup_scope();
 		// Track which panel each successive tile belongs to so we can detect
 		// boundary crossings inside the per-batch lock-and-write loop.
-		let last_panel_index: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+		// The key is the zoom-relative panel `(z, (id - zoom_base(z)) / scope)`,
+		// not `id / scope`: panels count from each zoom's start, and
+		// `zoom_base(z) mod 64 == 21`, so an absolute key resets the map
+		// 21 ids off the real panel start and lets runs cross panels.
+		let last_panel_index: Arc<Mutex<Option<(u8, u64)>>> = Arc::new(Mutex::new(None));
 		// Total unique tile blobs written across the archive — incremented as
 		// new blobs land in the writer. Replaces the post-traversal
 		// `dedup_map.len()` count, which was archive-scoped and stops being
@@ -165,7 +169,7 @@ impl TilesWriter for PMTilesWriter {
 							// Panel-pmtiles dedup-scope: clear the dedup map when
 							// crossing a panel boundary so dedup never spans panels.
 							if let Some(scope) = dedup_scope {
-								let panel_index = id / scope;
+								let panel_index = zoom_relative_panel(id, scope);
 								if last_panel.map_or(false, |last| last != panel_index) {
 									dedup.clear();
 								}
@@ -212,9 +216,15 @@ impl TilesWriter for PMTilesWriter {
 
 		header.tile_data = ByteRange::new(tile_data_start, tile_data_end - tile_data_start);
 
-		entries.merge_runs();
-
+		// With the panel layout a run must not cross a panel. With
+		// `--dedup-scope` the per-panel dedup reset above already gives the
+		// first tile of each panel a new blob. With `--leaf-align` alone the
+		// dedup is archive-wide, so this guard is what keeps a run inside
+		// its leaf.
 		let leaf_align = runtime.pmtiles_leaf_align();
+		let panel_sizes: Vec<u64> = [dedup_scope, leaf_align].into_iter().flatten().collect();
+		entries.merge_runs_within_panels(&panel_sizes);
+
 		let directory = entries.build_directory(16384 - HeaderV3::len(), INTERNAL_COMPRESSION, leaf_align)?;
 
 		// Write both directories at the END of the file, after the tile data.
@@ -252,7 +262,7 @@ mod tests {
 			pmtiles::PMTilesReader,
 		},
 	};
-	use versatiles_core::{TileBBox, TileFormat, TilePyramid, io::*};
+	use versatiles_core::{TileBBox, TileCoord, TileFormat, TilePyramid, io::*};
 	use versatiles_derive::context;
 
 	#[context("test: PMTiles read↔write roundtrip")]
@@ -350,15 +360,19 @@ mod tests {
 		// buckets, the (offset, length) pairs MUST differ — that's the
 		// dedup-scope contract.
 		use std::collections::HashMap;
-		let mut blob_per_panel: HashMap<u64, (u64, u64)> = HashMap::new();
+		// Panels are zoom-relative: (z, (tile_id - zoom_base(z)) / 64).
+		let mut blob_per_panel: HashMap<(u8, u64), (u64, u64)> = HashMap::new();
 		for e in &entries_vec {
-			let panel = e.tile_id / 64;
+			let panel = test_panel_of(e.tile_id, 64);
 			let blob = (e.range.offset, e.range.length);
 			match blob_per_panel.get(&panel) {
 				None => {
 					blob_per_panel.insert(panel, blob);
 				}
-				Some(existing) => assert_eq!(*existing, blob, "tiles in panel {panel} must share one blob (intra-panel dedup)"),
+				Some(existing) => assert_eq!(
+					*existing, blob,
+					"tiles in panel {panel:?} must share one blob (intra-panel dedup)"
+				),
 			}
 		}
 		// Cross-panel uniqueness: collect all panels' blobs into a set of
@@ -414,6 +428,155 @@ mod tests {
 
 		// All entry tile_ids should be reachable; just sanity-check the
 		// round-trip produced a usable archive.
+		Ok(())
+	}
+
+	/// Start of zoom `z` in the global Hilbert tile_id stream: (4^z - 1) / 3.
+	/// The test keeps its own copy so it does not share the writer's helper.
+	fn test_zoom_base(z: u8) -> u64 {
+		((1u64 << (2 * u32::from(z))) - 1) / 3
+	}
+
+	/// Zoom-relative panel of a tile_id: (zoom, (id - zoom_base) / panel_size).
+	fn test_panel_of(id: u64, panel_size: u64) -> (u8, u64) {
+		let mut z: u8 = 0;
+		while test_zoom_base(z + 1) <= id {
+			z += 1;
+		}
+		(z, (id - test_zoom_base(z)) / panel_size)
+	}
+
+	/// Reads every entry of an archive: the root and all leaves.
+	fn walk_all_entries(reader: &PMTilesReader) -> Result<Vec<EntryV3>> {
+		fn walk(entries: &EntriesV3, reader: &PMTilesReader, out: &mut Vec<EntryV3>) -> Result<()> {
+			for e in entries.iter() {
+				if e.run_length == 0 {
+					let blob = reader.leaves_bytes.read_range(&e.range)?;
+					let blob = versatiles_core::compression::decompress(blob, &reader.internal_compression)?;
+					walk(&EntriesV3::from_blob(&blob)?, reader, out)?;
+				} else {
+					out.push(*e);
+				}
+			}
+			Ok(())
+		}
+		let mut out = Vec::new();
+		walk(&reader.root_entries, reader, &mut out)?;
+		Ok(out)
+	}
+
+	/// Writes identical tiles around the zoom-relative panel boundaries of
+	/// zoom `z` with the Viatrail panel layout (`--dedup-scope panel8`,
+	/// `--leaf-align panel32`), then checks that no run crosses a panel8 or
+	/// a panel32 boundary, that every written tile is reachable, and that
+	/// runs still merge inside a panel.
+	async fn check_no_run_crosses_panel(z: u8, boundaries_rel: &[u64]) -> Result<()> {
+		check_no_run_crosses_panel_with(z, boundaries_rel, true).await
+	}
+
+	/// `dedup_scope = false` writes with `--leaf-align panel32` only (dedup is
+	/// archive-wide), so only panel32 boundaries are checked and every entry
+	/// in `boundaries_rel` must be a panel32 boundary.
+	async fn check_no_run_crosses_panel_with(z: u8, boundaries_rel: &[u64], dedup_scope: bool) -> Result<()> {
+		// For each boundary b, write the five tiles b-2 .. b+2. A boundary at
+		// relative 0 is the zoom start, so b-2 and b-1 are the last tiles of
+		// zoom z-1.
+		let mut ids = Vec::new();
+		for &rel in boundaries_rel {
+			let b = test_zoom_base(z) + rel;
+			ids.extend((b - 2)..=(b + 2));
+		}
+		let mut pyramid = TilePyramid::new_empty();
+		for &id in &ids {
+			pyramid.insert_coord(&TileCoord::from_hilbert_index(id)?);
+		}
+		let mut mock = MockReader::new_mock(
+			pyramid,
+			TileSourceMetadata::new(TileFormat::MVT, TileCompression::Uncompressed, Traversal::ANY, None),
+		)?;
+
+		let runtime = TilesRuntime::default();
+		if dedup_scope {
+			runtime.set_pmtiles_dedup_scope(64); // panel8
+		}
+		runtime.set_pmtiles_leaf_align(1024); // panel32
+
+		let mut data_writer = DataWriterBlob::new()?;
+		PMTilesWriter::write_to_writer(&mut mock, &mut data_writer, runtime.clone()).await?;
+		let reader = PMTilesReader::open_data(Box::new(DataReaderBlob::from(data_writer)), runtime).await?;
+
+		let entries = walk_all_entries(&reader)?;
+
+		// Reachable tiles == addressed tiles == the tiles written.
+		let mut reached: Vec<u64> = Vec::new();
+		for e in &entries {
+			reached.extend(e.tile_id..e.tile_id + u64::from(e.run_length));
+		}
+		reached.sort_unstable();
+		let mut expected = ids.clone();
+		expected.sort_unstable();
+		assert_eq!(reached, expected, "z{z}: reachable tiles must equal the tiles written");
+		assert_eq!(reader.header.addressed_tiles_count, expected.len() as u64);
+
+		for e in &entries {
+			let last = e.tile_id + u64::from(e.run_length) - 1;
+			let sizes: &[(&str, u64)] = if dedup_scope {
+				&[("panel8", 64), ("panel32", 1024)]
+			} else {
+				&[("panel32", 1024)]
+			};
+			for &(name, size) in sizes {
+				assert_eq!(
+					test_panel_of(e.tile_id, size),
+					test_panel_of(last, size),
+					"z{z}: entry {} run {} crosses a zoom-relative {name} boundary",
+					e.tile_id,
+					e.run_length
+				);
+			}
+		}
+
+		// Runs still merge inside a panel: b-2..b-1 is one run, b..b+2 is one run.
+		for &rel in boundaries_rel {
+			let b = test_zoom_base(z) + rel;
+			let before = entries.iter().find(|e| e.tile_id == b - 2).expect("entry at b-2");
+			let after = entries.iter().find(|e| e.tile_id == b).expect("entry at b");
+			assert_eq!(before.run_length, 2, "z{z}: tiles b-2..b-1 must merge into one run");
+			assert_eq!(after.run_length, 3, "z{z}: tiles b..b+2 must merge into one run");
+		}
+		Ok(())
+	}
+
+	// At z3 one panel8 (64 tiles) is the whole zoom, so the only panel
+	// boundaries are the zoom start and the start of z4.
+	#[tokio::test]
+	async fn no_run_crosses_panel_z3() -> Result<()> {
+		check_no_run_crosses_panel(3, &[0, 64]).await
+	}
+
+	#[tokio::test]
+	async fn no_run_crosses_panel_z7() -> Result<()> {
+		check_no_run_crosses_panel(7, &[0, 64, 1024, 3 * 1024 + 5 * 64]).await
+	}
+
+	#[tokio::test]
+	async fn no_run_crosses_panel_z12() -> Result<()> {
+		check_no_run_crosses_panel(12, &[0, 64, 1024, 5_383_168]).await
+	}
+
+	#[tokio::test]
+	async fn no_run_crosses_panel_z14() -> Result<()> {
+		check_no_run_crosses_panel(14, &[0, 64, 1024, 77 * 1024 + 9 * 64]).await
+	}
+
+	// `--leaf-align panel32` without `--dedup-scope`: all identical tiles
+	// share one blob, so only the merge_runs guard keeps runs in their leaf.
+	#[tokio::test]
+	async fn no_run_crosses_leaf_without_dedup_scope() -> Result<()> {
+		for z in [3u8, 7, 12, 14] {
+			let boundaries: &[u64] = if z == 3 { &[0, 64] } else { &[0, 1024, 5 * 1024] };
+			check_no_run_crosses_panel_with(z, boundaries, false).await?;
+		}
 		Ok(())
 	}
 }

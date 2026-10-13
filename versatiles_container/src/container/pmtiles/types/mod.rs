@@ -6,7 +6,7 @@ mod tile_compression;
 mod tile_type;
 
 pub use directory_v3::Directory;
-pub use entries_v3::EntriesV3;
+pub use entries_v3::{EntriesV3, zoom_relative_panel};
 pub use entry_v3::EntryV3;
 pub use header_v3::HeaderV3;
 pub use tile_compression::PMTilesCompression;

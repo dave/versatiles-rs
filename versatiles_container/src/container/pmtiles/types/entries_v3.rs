@@ -372,13 +372,32 @@ impl EntriesV3 {
 	/// single entries with accumulated `run_length`. Entries must be sorted
 	/// by `tile_id` before calling this method.
 	pub fn merge_runs(&mut self) {
+		self.merge_runs_within_panels(&[]);
+	}
+
+	/// Like [`merge_runs`](Self::merge_runs), but never lets a run cross a
+	/// zoom-relative panel boundary for any of `panel_sizes` (see
+	/// [`zoom_relative_panel`]). An empty slice merges without limits.
+	///
+	/// The panel layout (`--dedup-scope`, `--leaf-align`) needs this: a
+	/// leaf holds one panel, so a run that starts in one panel and covers
+	/// tiles of the next one puts those tiles behind the wrong leaf.
+	pub fn merge_runs_within_panels(&mut self, panel_sizes: &[u64]) {
 		if self.entries.len() <= 1 {
 			return;
 		}
+		let same_panels = |a: u64, b: u64| {
+			panel_sizes
+				.iter()
+				.all(|&size| zoom_relative_panel(a, size) == zoom_relative_panel(b, size))
+		};
 		let mut merged = Vec::with_capacity(self.entries.len());
 		let mut current = self.entries[0];
 		for &entry in &self.entries[1..] {
-			if entry.range == current.range && entry.tile_id == current.tile_id + u64::from(current.run_length) {
+			if entry.range == current.range
+				&& entry.tile_id == current.tile_id + u64::from(current.run_length)
+				&& same_panels(current.tile_id, entry.tile_id + u64::from(entry.run_length.max(1)) - 1)
+			{
 				current.run_length += entry.run_length;
 			} else {
 				merged.push(current);
@@ -388,6 +407,31 @@ impl EntriesV3 {
 		merged.push(current);
 		self.entries = merged;
 	}
+}
+
+/// Zoom level of a Hilbert `tile_id` and the first tile_id of that zoom,
+/// `(4^z - 1) / 3`.
+pub fn zoom_and_base(tile_id: u64) -> (u8, u64) {
+	let mut z: u8 = 0;
+	let mut base: u64 = 0;
+	// The next zoom starts at base + 4^z.
+	while z < 31 && base + (1u64 << (2 * u32::from(z))) <= tile_id {
+		base += 1u64 << (2 * u32::from(z));
+		z += 1;
+	}
+	(z, base)
+}
+
+/// Zoom-relative panel of a Hilbert `tile_id`: `(z, (tile_id - zoom_base(z)) / panel_size)`.
+///
+/// Panels count from the start of each zoom, not from tile_id 0. For
+/// `z >= 3`, `zoom_base(z) mod 64 == 21`, so `tile_id / 64` is 21 ids off
+/// the real panel8 start. The zoom is part of the key, so the zooms that
+/// are smaller than one panel (z < 3 for panel8, z < 5 for panel32) are
+/// each a panel of their own.
+pub fn zoom_relative_panel(tile_id: u64, panel_size: u64) -> (u8, u64) {
+	let (z, base) = zoom_and_base(tile_id);
+	(z, (tile_id - base) / panel_size)
 }
 
 impl Default for EntriesV3 {
@@ -654,6 +698,67 @@ mod tests {
 		assert_eq!(entries.tile_count(), 6);
 	}
 
+	#[test]
+	fn test_zoom_and_base() {
+		assert_eq!(zoom_and_base(0), (0, 0));
+		assert_eq!(zoom_and_base(1), (1, 1));
+		assert_eq!(zoom_and_base(4), (1, 1));
+		assert_eq!(zoom_and_base(5), (2, 5));
+		assert_eq!(zoom_and_base(20), (2, 5));
+		assert_eq!(zoom_and_base(21), (3, 21));
+		assert_eq!(zoom_and_base(5_592_405), (12, 5_592_405));
+		assert_eq!(zoom_and_base(5_592_404), (11, 1_398_101));
+		assert_eq!(zoom_and_base(10_975_573), (12, 5_592_405));
+		for z in 3u8..=20 {
+			let base = ((1u64 << (2 * u32::from(z))) - 1) / 3;
+			assert_eq!(zoom_and_base(base), (z, base));
+			assert_eq!(base % 64, 21, "z{z}");
+		}
+	}
+
+	/// The run from the osm.20260608 conversion: id 10975571 with run 45
+	/// crossed the panel32 leaf that starts at 10975573 (z12, relative
+	/// 5383168 = 1024 * 5257).
+	#[test]
+	fn test_merge_runs_within_panels_stops_at_zoom_relative_boundary() {
+		let boundary = 10_975_573u64;
+		let mut entries = EntriesV3::new();
+		for id in (boundary - 2)..(boundary + 43) {
+			entries.push(EntryV3::new(id, ByteRange::new(0, 100), 1));
+		}
+		let mut unlimited = EntriesV3::new();
+		for e in entries.iter() {
+			unlimited.push(*e);
+		}
+		unlimited.merge_runs();
+		assert_eq!(unlimited.len(), 1, "control: without panels the run crosses");
+
+		entries.merge_runs_within_panels(&[64, 1024]);
+		assert_eq!(entries.len(), 2);
+		assert_eq!(
+			(entries.entries[0].tile_id, entries.entries[0].run_length),
+			(boundary - 2, 2)
+		);
+		assert_eq!(
+			(entries.entries[1].tile_id, entries.entries[1].run_length),
+			(boundary, 43)
+		);
+		assert_eq!(entries.tile_count(), 45);
+	}
+
+	#[test]
+	fn test_merge_runs_within_panels_stops_at_zoom_start() {
+		// z2 is ids 5..=20, z3 is ids 21..=84: one panel8 each.
+		let mut entries = EntriesV3::new();
+		for id in 18..24 {
+			entries.push(EntryV3::new(id, ByteRange::new(0, 100), 1));
+		}
+		entries.merge_runs_within_panels(&[64]);
+		assert_eq!(entries.len(), 2);
+		assert_eq!((entries.entries[0].tile_id, entries.entries[0].run_length), (18, 3));
+		assert_eq!((entries.entries[1].tile_id, entries.entries[1].run_length), (21, 3));
+	}
+
 	/// Tests the build_directory function for correct directory structure creation
 	#[test]
 	fn test_build_directory_structure() -> Result<()> {
@@ -728,10 +833,7 @@ mod tests {
 			for e in leaf.iter() {
 				let coord = TileCoord::from_hilbert_index(e.tile_id)?;
 				let cell = (coord.level, coord.x / 2, coord.y / 2);
-				assert_eq!(
-					cell, expected_cell,
-					"all entries in one leaf must share (z, x/2, y/2)"
-				);
+				assert_eq!(cell, expected_cell, "all entries in one leaf must share (z, x/2, y/2)");
 			}
 		}
 
@@ -799,10 +901,7 @@ mod tests {
 		let root = entries_from_blob(&directory.root_bytes, TileCompression::Uncompressed)?;
 		let mut reconstructed: Vec<EntryV3> = Vec::new();
 		for root_entry in root.iter() {
-			let leaf_bytes = directory
-				.leaves_bytes
-				.read_range(&root_entry.range)
-				.unwrap();
+			let leaf_bytes = directory.leaves_bytes.read_range(&root_entry.range).unwrap();
 			let leaf = entries_from_blob(&leaf_bytes, TileCompression::Uncompressed)?;
 			for e in leaf.iter() {
 				reconstructed.push(*e);
@@ -841,11 +940,27 @@ mod tests {
 		// z=0..z=4: each whole zoom is one leaf with 1, 4, 16, 64, 256 entries.
 		assert_eq!(zoom_leaf_sizes.get(&0), Some(&vec![1u64]), "z=0 → 1 leaf of 1 entry");
 		assert_eq!(zoom_leaf_sizes.get(&1), Some(&vec![4u64]), "z=1 → 1 leaf of 4 entries");
-		assert_eq!(zoom_leaf_sizes.get(&2), Some(&vec![16u64]), "z=2 → 1 leaf of 16 entries");
-		assert_eq!(zoom_leaf_sizes.get(&3), Some(&vec![64u64]), "z=3 → 1 leaf of 64 entries");
-		assert_eq!(zoom_leaf_sizes.get(&4), Some(&vec![256u64]), "z=4 → 1 leaf of 256 entries");
+		assert_eq!(
+			zoom_leaf_sizes.get(&2),
+			Some(&vec![16u64]),
+			"z=2 → 1 leaf of 16 entries"
+		);
+		assert_eq!(
+			zoom_leaf_sizes.get(&3),
+			Some(&vec![64u64]),
+			"z=3 → 1 leaf of 64 entries"
+		);
+		assert_eq!(
+			zoom_leaf_sizes.get(&4),
+			Some(&vec![256u64]),
+			"z=4 → 1 leaf of 256 entries"
+		);
 		// z=5: 32×32 grid = 1 panel32 cell → 1 leaf of 1024 entries.
-		assert_eq!(zoom_leaf_sizes.get(&5), Some(&vec![1024u64]), "z=5 → 1 leaf of 1024 entries");
+		assert_eq!(
+			zoom_leaf_sizes.get(&5),
+			Some(&vec![1024u64]),
+			"z=5 → 1 leaf of 1024 entries"
+		);
 		// z=6: 64×64 grid = 4 panel32 cells → 4 leaves of 1024 entries each.
 		assert_eq!(
 			zoom_leaf_sizes.get(&6),
@@ -880,7 +995,10 @@ mod tests {
 		);
 
 		// Sanity: the leaf contains all 1024 entries with the right tile_ids.
-		let leaf_bytes = directory.leaves_bytes.read_range(&root.iter().next().unwrap().range).unwrap();
+		let leaf_bytes = directory
+			.leaves_bytes
+			.read_range(&root.iter().next().unwrap().range)
+			.unwrap();
 		let leaf = entries_from_blob(&leaf_bytes, TileCompression::Uncompressed)?;
 		assert_eq!(leaf.len(), 1024, "z=5 leaf must hold all 1024 z=5 entries");
 		Ok(())

@@ -99,7 +99,8 @@ pub struct Subcommand {
 	tile_format: Option<String>,
 
 	/// PMTiles output only: scope blob deduplication to consecutive
-	/// `panel8` blocks of 64 Hilbert-ordered tiles. The dedup map is
+	/// `panel8` blocks of 64 Hilbert-ordered tiles, counted from the
+	/// start of each zoom (not from tile_id 0). The dedup map is
 	/// reset at every panel[8] boundary, so identical-content tiles in
 	/// different panel[8]s do NOT share a blob. Used by the panel-pmtiles
 	/// format to keep any panel-aligned tile_id range mapped to a
@@ -109,7 +110,8 @@ pub struct Subcommand {
 
 	/// PMTiles output only: pack leaf directories so each leaf covers
 	/// exactly one `panel32` (1024 tiles) of consecutive Hilbert tile_ids,
-	/// aligned to panel[32] boundaries. Root entries' tile_ids are
+	/// aligned to panel[32] boundaries counted from the start of each
+	/// zoom. No run-length entry crosses a leaf. Root entries' tile_ids are
 	/// panel_start values. Without this flag the encoder packs leaves
 	/// to fit a byte budget (upstream default), which doesn't align with
 	/// any tile_id grid.
