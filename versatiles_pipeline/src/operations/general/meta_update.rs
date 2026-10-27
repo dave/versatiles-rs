@@ -23,7 +23,7 @@ struct Args {
 	legend: Option<String>,
 	/// Name text.
 	name: Option<String>,
-	/// Tile schema, allowed values: "rgb", "rgba", "dem/mapbox", "dem/terrarium", "dem/versatiles", "openmaptiles", "shortbread@1.0", "other", "unknown"
+	/// Tile schema, allowed values: "rgb", "rgba", "dem/mapbox", "dem/terrarium", "dem/versatiles", "openmaptiles", "shortbread@1.0", "shortbread@1.1", "other", "unknown"
 	schema: Option<TileSchema>,
 }
 

@@ -22,7 +22,8 @@ use enumset::{EnumSet, EnumSetType};
 /// ## Vector schemas
 /// * **`VectorOpenMapTiles`** – Tiles conform to the *`OpenMapTiles`* MVT
 ///   schema.
-/// * **`VectorShortbread1`** – *Shortbread* schema version 1.0.
+/// * **`VectorShortbread1_0`** – *Shortbread* schema version 1.0.
+/// * **`VectorShortbread1_1`** – *Shortbread* schema version 1.1.
 /// * **`VectorOther`** – Any other vector schema not listed above.
 ///
 /// ## Unknown
@@ -41,8 +42,10 @@ pub enum TileSchema {
 	RasterDEMVersatiles,
 	/// Vector tiles conforming to the OpenMapTiles schema (<https://openmaptiles.org/>).
 	VectorOpenMapTiles,
-	/// Vector tiles conforming to the Shortbread schema (<https://shortbread-tiles.org/>).
+	/// Vector tiles conforming to the Shortbread 1.0 schema (<https://shortbread-tiles.org/schema/1.0/>).
 	VectorShortbread1_0,
+	/// Vector tiles conforming to the Shortbread 1.1 schema (<https://shortbread-tiles.org/schema/1.1/>).
+	VectorShortbread1_1,
 	/// Any other vector schema not listed above.
 	VectorOther,
 	/// Used when the schema string cannot be parsed.
@@ -65,7 +68,7 @@ impl TileSchema {
 	pub fn as_str(&self) -> &str {
 		use TileSchema::{
 			RasterDEMMapbox, RasterDEMTerrarium, RasterDEMVersatiles, RasterRGB, RasterRGBA, Unknown, VectorOpenMapTiles,
-			VectorOther, VectorShortbread1_0,
+			VectorOther, VectorShortbread1_0, VectorShortbread1_1,
 		};
 		match self {
 			RasterRGB => "rgb",
@@ -75,6 +78,7 @@ impl TileSchema {
 			RasterDEMVersatiles => "dem/versatiles",
 			VectorOpenMapTiles => "openmaptiles",
 			VectorShortbread1_0 => "shortbread@1.0",
+			VectorShortbread1_1 => "shortbread@1.1",
 			VectorOther => "other",
 			Unknown => "unknown",
 		}
@@ -101,6 +105,7 @@ impl TileSchema {
 			"dem/versatiles",
 			"openmaptiles",
 			"shortbread@1.0",
+			"shortbread@1.1",
 			"other",
 		]
 	}
@@ -120,11 +125,11 @@ impl TileSchema {
 	pub fn tile_type(&self) -> TileType {
 		use TileSchema::{
 			RasterDEMMapbox, RasterDEMTerrarium, RasterDEMVersatiles, RasterRGB, RasterRGBA, Unknown, VectorOpenMapTiles,
-			VectorOther, VectorShortbread1_0,
+			VectorOther, VectorShortbread1_0, VectorShortbread1_1,
 		};
 		match self {
 			RasterRGB | RasterRGBA | RasterDEMMapbox | RasterDEMTerrarium | RasterDEMVersatiles => TileType::Raster,
-			VectorOpenMapTiles | VectorShortbread1_0 | VectorOther => TileType::Vector,
+			VectorOpenMapTiles | VectorShortbread1_0 | VectorShortbread1_1 | VectorOther => TileType::Vector,
 			Unknown => TileType::Unknown,
 		}
 	}
@@ -141,8 +146,8 @@ impl TryFrom<&str> for TileSchema {
 
 	fn try_from(value: &str) -> Result<Self, Self::Error> {
 		use TileSchema::{
-			RasterDEMMapbox, RasterDEMTerrarium, RasterDEMVersatiles, RasterRGB, RasterRGBA, VectorOpenMapTiles,
-			VectorOther, VectorShortbread1_0,
+			RasterDEMMapbox, RasterDEMTerrarium, RasterDEMVersatiles, RasterRGB, RasterRGBA, Unknown, VectorOpenMapTiles,
+			VectorOther, VectorShortbread1_0, VectorShortbread1_1,
 		};
 		Ok(match value.to_lowercase().as_str() {
 			"rgb" => RasterRGB,
@@ -152,7 +157,11 @@ impl TryFrom<&str> for TileSchema {
 			"dem/versatiles" => RasterDEMVersatiles,
 			"openmaptiles" => VectorOpenMapTiles,
 			"shortbread@1.0" => VectorShortbread1_0,
+			"shortbread@1.1" => VectorShortbread1_1,
 			"other" => VectorOther,
+			// What `as_str` writes for `Unknown`, so a schema that was written
+			// out reads back (the writer emits it). Not offered in `variants`.
+			"unknown" => Unknown,
 			_ => bail!(
 				"Invalid tile schema: {value}. Only supported schemas are: {}",
 				EnumSet::<TileSchema>::all()
@@ -180,6 +189,7 @@ mod tests {
 			(RasterDEMVersatiles, "dem/versatiles"),
 			(VectorOpenMapTiles, "openmaptiles"),
 			(VectorShortbread1_0, "shortbread@1.0"),
+			(VectorShortbread1_1, "shortbread@1.1"),
 			(VectorOther, "other"),
 			(Unknown, "unknown"),
 		] {
@@ -201,6 +211,7 @@ mod tests {
 			(RasterDEMVersatiles, Raster),
 			(VectorOpenMapTiles, Vector),
 			(VectorShortbread1_0, Vector),
+			(VectorShortbread1_1, Vector),
 			(VectorOther, Vector),
 			(TileSchema::Unknown, TileType::Unknown),
 		] {
@@ -220,12 +231,31 @@ mod tests {
 			("dem/versatiles", RasterDEMVersatiles),
 			("openmaptiles", VectorOpenMapTiles),
 			("shortbread@1.0", VectorShortbread1_0),
+			("shortbread@1.1", VectorShortbread1_1),
 			("other", VectorOther),
+			("unknown", Unknown),
 		] {
 			assert_eq!(TileSchema::try_from(text).unwrap(), schema);
 		}
 
 		assert!(TileSchema::try_from("invalid").is_err());
+		assert!(TileSchema::try_from("shortbread@9.9").is_err());
+	}
+
+	#[test]
+	fn shortbread_1_1_round_trips() {
+		let schema = TileSchema::try_from("shortbread@1.1").unwrap();
+		assert_eq!(schema, TileSchema::VectorShortbread1_1);
+		assert_eq!(schema.as_str(), "shortbread@1.1");
+		assert_eq!(TileSchema::try_from(schema.as_str()).unwrap(), schema);
+		assert_eq!(schema.tile_type(), TileType::Vector);
+	}
+
+	#[test]
+	fn every_as_str_round_trips() {
+		for schema in EnumSet::<TileSchema>::all() {
+			assert_eq!(TileSchema::try_from(schema.as_str()).unwrap(), schema);
+		}
 	}
 
 	#[test]

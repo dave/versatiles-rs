@@ -375,7 +375,7 @@ Update metadata, see also <https://github.com/mapbox/tilejson-spec/tree/master/3
 - *`fillzoom`: u8 (optional)* - Fill zoom level.
 - *`legend`: String (optional)* - Legend text.
 - *`name`: String (optional)* - Name text.
-- *`schema`: TileSchema (optional)* - Tile schema, allowed values: "rgb", "rgba", "dem/mapbox", "dem/terrarium", "dem/versatiles", "openmaptiles", "shortbread@1.0", "other", "unknown"
+- *`schema`: TileSchema (optional)* - Tile schema, allowed values: "rgb", "rgba", "dem/mapbox", "dem/terrarium", "dem/versatiles", "openmaptiles", "shortbread@1.0", "shortbread@1.1", "other", "unknown"
 
 ---
 

@@ -121,7 +121,10 @@ impl VersaTilesReader {
 				.await
 				.context("Failed reading the meta data")?;
 			let blob = decompress(blob, &header.compression).context("Failed decompressing the meta data")?;
-			TileJSON::try_from_blob_or_default(&blob)
+			// A metadata blob that is present but does not parse is an error. Falling back to a
+			// default TileJSON would silently drop attribution, vector_layers and custom keys
+			// from every converted output. Only an absent blob (length 0) uses the default.
+			TileJSON::try_from(blob.as_str()).context("Failed parsing the meta data as TileJSON")?
 		} else {
 			TileJSON::default()
 		};
@@ -457,7 +460,10 @@ mod tests {
 	use super::*;
 	use crate::{MOCK_BYTES_PBF, MockReader, TilesRuntime, TilesWriter, VersaTilesWriter, make_test_file};
 	use assert_fs::NamedTempFile;
-	use versatiles_core::{Blob, TileCompression, TileFormat, TilePyramid, assert_wildcard, io::DataWriterBlob};
+	use versatiles_core::{
+		Blob, TileCompression, TileFormat, TilePyramid, assert_wildcard,
+		io::{DataReaderBlob, DataWriterBlob},
+	};
 
 	// Helper to quickly create a test reader and bbox
 	async fn mk_reader() -> Result<(NamedTempFile, VersaTilesReader)> {
@@ -592,6 +598,57 @@ mod tests {
 
 		assert_eq!(reader2, reader3);
 
+		Ok(())
+	}
+
+	/// Write a versatiles file (uncompressed, so the metadata JSON is plain bytes)
+	/// whose TileJSON declares `tile_schema: shortbread@1.1`.
+	async fn write_shortbread_1_1_file() -> Result<Vec<u8>> {
+		let mut source = MockReader::new_mock(
+			TilePyramid::new_full_up_to(2),
+			TileSourceMetadata::new(TileFormat::MVT, TileCompression::Uncompressed, Traversal::ANY, None),
+		)?;
+		source.tilejson_mut().tile_schema = Some(versatiles_core::TileSchema::VectorShortbread1_1);
+		let mut data_writer = DataWriterBlob::new()?;
+		VersaTilesWriter::write_to_writer(&mut source, &mut data_writer, TilesRuntime::default()).await?;
+		Ok(data_writer.as_slice().to_vec())
+	}
+
+	#[tokio::test]
+	async fn reads_shortbread_1_1_tile_schema() -> Result<()> {
+		let bytes = write_shortbread_1_1_file().await?;
+		let reader = VersaTilesReader::open_data(Box::new(DataReaderBlob::from(bytes)), TilesRuntime::default()).await?;
+		assert_eq!(
+			reader.tilejson().tile_schema,
+			Some(versatiles_core::TileSchema::VectorShortbread1_1)
+		);
+		assert!(
+			reader
+				.tilejson()
+				.stringify()
+				.contains("\"tile_schema\":\"shortbread@1.1\"")
+		);
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn invalid_tile_schema_in_metadata_is_an_error() -> Result<()> {
+		let mut bytes = write_shortbread_1_1_file().await?;
+		// Same length, so every byte range in the header stays valid.
+		let needle = b"shortbread@1.1";
+		let pos = bytes
+			.windows(needle.len())
+			.position(|w| w == needle)
+			.expect("metadata JSON holds the tile_schema");
+		bytes[pos..pos + needle.len()].copy_from_slice(b"shortbread@9.9");
+
+		let result = VersaTilesReader::open_data(Box::new(DataReaderBlob::from(bytes)), TilesRuntime::default()).await;
+		let err = format!(
+			"{:?}",
+			result.expect_err("an unparseable tile_schema must not fall back to a default TileJSON")
+		);
+		assert!(err.contains("Failed parsing the meta data as TileJSON"), "{err}");
+		assert!(err.contains("shortbread@9.9"), "{err}");
 		Ok(())
 	}
 
