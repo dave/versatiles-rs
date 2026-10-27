@@ -203,7 +203,9 @@ impl TileFormat {
 			"image/webp" => WEBP,
 			"image/avif" => AVIF,
 			"image/svg+xml" => SVG,
-			"vnd.mapbox-vector-tile" => MVT,
+			// The full IANA type, as versatiles >= 5 writes it into TileJSON, and the
+			// bare name that `as_mime_str` still returns in this fork.
+			"application/vnd.mapbox-vector-tile" | "vnd.mapbox-vector-tile" => MVT,
 			"application/geo+json" => GEOJSON,
 			"application/topo+json" => TOPOJSON,
 			"application/json" => JSON,
@@ -546,6 +548,15 @@ mod tests {
 	fn should_try_from_mime_parse_valid_and_error_invalid() {
 		assert_eq!(TileFormat::try_from_mime("image/webp").unwrap(), TileFormat::WEBP);
 		assert!(TileFormat::try_from_mime("application/x-unknown").is_err());
+	}
+
+	#[test]
+	fn should_try_from_mime_accept_both_mvt_names() {
+		assert_eq!(TileFormat::try_from_mime("vnd.mapbox-vector-tile").unwrap(), MVT);
+		assert_eq!(
+			TileFormat::try_from_mime("application/vnd.mapbox-vector-tile").unwrap(),
+			MVT
+		);
 	}
 
 	#[rstest]
